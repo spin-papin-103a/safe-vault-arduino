@@ -3,6 +3,8 @@
 #include <LiquidCrystal_I2C.h>
 #include <Keypad.h>
 #include <SHA256.h>
+#include "sha1.h"
+#include "TOTP.h"
 
 //RFID and LCD
 #define RST_PIN 9
@@ -24,6 +26,9 @@ byte rowPins[ROWS] = {2, 3, 4, 5};
 byte colPins[COLS] = {6, 7, 8};
 Keypad keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
+//Time
+long time = 1737753600;
+
 //Menu items
 const int menuItemsCount = 5;
 const char* menuItems[] = {
@@ -44,6 +49,7 @@ int step = 0;
 int displayStartMenu = 0;
 int displayStartMenuCards = 0;
 int cardRemoving = 0;
+int cardSelecting = 0;
 
 //PIN management
 char pin[7];
@@ -58,6 +64,13 @@ bool checkingPin = false;
 //Card management
 byte storedCards[9][4];
 int cardCount = 0;
+
+//2FA
+char* cardsSecrets[9] = {0};
+TOTP* totps[9];
+int foundId = 0;
+char code2FA[7];
+int code2FALength = 0;
 
 //Animation
 int dotAnim = 0;
@@ -90,7 +103,7 @@ void loop() {
   } 
   // Default card scanning mode
   else if (!logged) {
-    check_card();
+    check_card(key);
   }
 }
 
@@ -163,15 +176,16 @@ void main_menu(char key) {
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("All cards:");
-        delay(1000);
+        delay(1500);
         show_page_cards(displayStartMenuCards);
         step = 3;
       }
       else if (key == '3' && displayStartMenu==2) { // 2FA CONFIG
         lcd.clear();
         lcd.setCursor(0, 0);
-        lcd.print("Pair BT...");
-        pinLength = 0;
+        lcd.print("Select card for 2FA");
+        delay(1500);
+        show_page_cards(displayStartMenuCards);
         step = 6;
       }  
       else if (key == '4' && displayStartMenu==2) { // Set PIN
@@ -296,9 +310,62 @@ void main_menu(char key) {
       }
       break;
     case 6:
-      if (key) {
-        // BLUETOOTH SCRIPT TO PAIR AND CONFIG...
+      if (key == '#') {
+        displayStartMenuCards += 2;
+        if (displayStartMenuCards >= cardCount) displayStartMenuCards = 0;
+        show_page_cards(displayStartMenuCards);
+      } 
+      else if (key == '*') {
+        displayStartMenuCards = 0;
+        step = 0;
+      } 
+      else if (key && key != '0') { // Select card
+        int index = key - '0';
+        if (index <= cardCount) {
+          char uidStr[16];
+          format_UID(uidStr, storedCards[index - 1], 4);
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Selected card:");
+          lcd.setCursor(0, 1);
+          lcd.print(uidStr);
+          delay(2000);
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Waiting for pair...");
+          step = 7;
+          cardSelecting = index - 1;
+        }
       }
+    case 7:
+      if(true){ //true -> if connected
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Confirm *-No #-Yes");
+        step = 8;
+      }
+      if (key == '*') {
+        show_page_cards(displayStartMenuCards);
+        step = 6;
+      }
+    case 8:
+      if (key == '#') {
+        int keyLen = 0;
+        cardsSecrets[cardSelecting] = "SECRET"; //SECRET GET SECRET
+        uint8_t* hmacKey = convertCharToKey(cardsSecrets[cardSelecting], &keyLen);
+        totps[cardSelecting] = new TOTP(hmacKey, keyLen);
+        //timeDif = time.time() - bf.time;
+        //getTime -> time.time() + timeDif;
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("All set!");
+        delay(2000);
+        step = 0;
+      } 
+      else if (key == '*') {
+        show_page_cards(displayStartMenuCards);
+        step = 6;
+      } 
   }
 }
 
@@ -340,7 +407,41 @@ void remove_card(int index) {
 
 
 //CARD READING
-void check_card() {
+void check_card(char key) {
+  if(step == 1){ //2FA CODE
+    if(key){
+      if (key >= '0' && key <= '9' && code2FALength < 6) {
+          code2FA[code2FALength++] = key;
+          code2FA[code2FALength] = '\0';
+        } 
+        else if (key == '*') { // Backspace or exit
+          if (code2FALength > 0) {
+            code2FALength--;
+            code2FA[code2FALength] = '\0';
+          } else step = 0;
+        } 
+        else if (key == '#' && pinLength == 6) {
+          char* newCode = totps[foundId]->getCode(time); //GET CODE FROM TOTPS
+          if(strcmp(code2FA, newCode) != 0) {
+            code2FALength = 0;
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("OK");
+            delay(3000);
+            step = 0;
+          }else{
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Wrong code!");
+            delay(3000);
+          }
+        }
+
+        // Display PIN as stars
+        lcd.setCursor(0, 1);
+        lcd.print(String(code2FA) + "      ");
+    }
+  }
   static unsigned long lastAnimTime = 0;
   lcd.setCursor(0, 0);
   lcd.print("Locked");
@@ -372,6 +473,7 @@ void check_card() {
   for (int i = 0; i < cardCount; i++) {
     if (memcmp(storedCards[i], mfrc522.uid.uidByte, 4) == 0) {
       found = true;
+      foundId = i;
       break;
     }
   }
@@ -380,11 +482,19 @@ void check_card() {
   lcd.clear();
   lcd.setCursor(0, 0);
   if (found) {
-    lcd.print("OK");
-    Serial.println("Card authorized");
-
-    // ALL OK - LOGGED
-    // START CHECK 2FA
+    if(cardsSecrets[foundId] != 0){
+        lcd.print("Enter 2FA code:");
+        step = 1;
+        delay(2000);
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Enter code");
+        pinLength = 0;
+        return;
+    }else{
+      lcd.print("Card authorized");
+      Serial.println("Card authorized");
+    }
     
   } else {
     lcd.setCursor(0, 0);
@@ -535,3 +645,23 @@ void show_page_cards(int startIndex) {
     }
   }
 }
+
+uint8_t* convertCharToKey(const char* str, int* keyLength) {
+    int len = 0;
+
+    while (str[len] != '\0') {
+        len++;
+    }
+
+    *keyLength = len;
+
+    uint8_t* key = (uint8_t*)malloc(len);
+
+    for (int i = 0; i < len; i++) {
+        key[i] = (uint8_t)str[i];
+    }
+
+    return key;
+}
+
+
